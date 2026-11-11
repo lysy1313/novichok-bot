@@ -1,82 +1,20 @@
-import os
-import requests
 import telebot
-from telebot import types
-from dotenv import load_dotenv
-
-load_dotenv()
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
-print("--- Инициализация бота ---")
-print("SUPABASE_URL:", SUPABASE_URL if SUPABASE_URL else "НЕ ЗАДАН В .ENV!")
-print("SUPABASE_KEY задан:", bool(SUPABASE_KEY))
-print("BOT_TOKEN задан:", bool(BOT_TOKEN))
+from config import BOT_TOKEN
+import db
+import keyboards
 
 bot = telebot.TeleBot(BOT_TOKEN)
-
-HEADERS = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Content-Type": "application/json",
-    "Prefer": "return=representation"
-}
-
 user_sessions = {}
 
-def get_employees():
-    url = f"{SUPABASE_URL}/rest/v1/employees?select=id,full_name,department,role,mentor_name&order=id.desc&limit=8"
-    print(f"Запрос к Supabase: GET {url}")
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=5)
-        print(f"Ответ Supabase: статус {r.status_code}")
-        if r.status_code == 200:
-            data = r.json()
-            print(f"Успешно получено сотрудников: {len(data)}")
-            return data
-        else:
-            print(f"Ошибка ответа Supabase (код {r.status_code}): {r.text}")
-            return []
-    except Exception as e:
-        print("Исключение при запросе к Supabase:", e)
-        return []
-
-def save_pulse(emp_id, lunch_ok, mentor_helped, tasks_clear, sos_signal, comment, risk_level):
-    url = f"{SUPABASE_URL}/rest/v1/pulse_checks"
-    payload = {
-        "employee_id": emp_id,
-        "lunch_ok": lunch_ok,
-        "mentor_helped": mentor_helped,
-        "tasks_clear": tasks_clear,
-        "sos_signal": sos_signal,
-        "comment": comment,
-        "risk_level": risk_level
-    }
-    print(f"Сохранение пульса: POST {url} (emp_id={emp_id}, risk={risk_level})")
-    try:
-        r = requests.post(url, headers=HEADERS, json=payload, timeout=5)
-        print(f"Ответ сохранения пульса: статус {r.status_code}")
-    except Exception as e:
-        print("Ошибка сохранения пульса:", e)
-
-@bot.message_handler(commands=['start'])
+@bot.message_handler(commands=['start', 'menu'])
 def cmd_start(message):
-    print(f"Получена команда /start от пользователя {message.from_user.id}")
-    employees = get_employees()
-    markup = types.InlineKeyboardMarkup()
-    for emp in employees:
-        markup.add(types.InlineKeyboardButton(
-            text=f"👤 {emp['full_name']} ({emp['department']})",
-            callback_data=f"emp_{emp['id']}"
-        ))
-
+    employees = db.get_employees()
+    markup = keyboards.build_employees_menu(employees)
     bot.send_message(
         message.chat.id,
         "👋 **Добро пожаловать в команду «СпортТовары»!**\n\n"
         "Я твой цифровой напарник на время испытательного срока.\n"
-        "Помогу не потеряться, подскажу главное и вовремя помогу, если возникли трудности.\n\n"
+        "Помогу сориентироваться, отмечать задачи смены и вовремя помогу при трудностях.\n\n"
         "👇 **Выбери себя из списка новичков:**",
         reply_markup=markup,
         parse_mode="Markdown"
@@ -86,23 +24,47 @@ def cmd_start(message):
 def select_emp(call):
     emp_id = int(call.data.split("_")[1])
     user_sessions[call.from_user.id] = {"emp_id": emp_id}
-
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("📋 Памятка на смену", callback_data="memo"))
-    markup.add(types.InlineKeyboardButton("📊 Пройти пульс дня (15 сек)", callback_data="q_lunch"))
-    markup.add(types.InlineKeyboardButton("🆘 Мне нужна помощь (SOS)", callback_data="sos"))
+    db.link_telegram_id(emp_id, call.from_user.id)
 
     bot.edit_message_text(
-        "✅ Отлично, профиль выбран!\nЧем могу помочь сегодня?",
+        "✅ **Профиль выбран!**\nЧем займёмся сегодня?",
         call.message.chat.id,
         call.message.message_id,
-        reply_markup=markup
+        reply_markup=keyboards.build_main_menu(),
+        parse_mode="Markdown"
     )
 
+# --- 1. ЗАДАЧИ НА СМЕНУ ---
+@bot.callback_query_handler(func=lambda call: call.data == "tasks_menu")
+def show_tasks_menu(call):
+    emp_id = user_sessions.get(call.from_user.id, {}).get("emp_id", 1)
+    tasks = db.get_employee_tasks(emp_id)
+    markup = keyboards.build_tasks_menu(tasks)
+
+    if not tasks:
+        text = "📝 **Задачи на смену:**\n\nНаставник ещё не добавил задачи на сегодня. Скоро они появятся здесь!"
+    else:
+        text = "📝 **Твой чеклист задач от наставника:**\n\n*(Нажми на задачу, чтобы отметить её выполненной)*"
+
+    bot.edit_message_text(
+        text,
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("toggle_"))
+def handle_toggle_task(call):
+    parts = call.data.split("_")
+    task_id = int(parts[1])
+    current_status = (parts[2].lower() == 'true')
+    db.toggle_task(task_id, current_status)
+    show_tasks_menu(call)
+
+# --- 2. ПАМЯТКА ---
 @bot.callback_query_handler(func=lambda call: call.data == "memo")
 def show_memo(call):
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu"))
     bot.edit_message_text(
         "📋 **Главное на смене:**\n\n"
         "1. **Форма и шкафчик:** Раздевалка на 2 этаже, ключ у старшего смены.\n"
@@ -111,20 +73,18 @@ def show_memo(call):
         "4. **Любой вопрос:** Не стесняйся спрашивать наставника — глупых вопросов нет!",
         call.message.chat.id,
         call.message.message_id,
-        reply_markup=markup,
+        reply_markup=keyboards.build_back_menu(),
         parse_mode="Markdown"
     )
 
+# --- 3. ПУЛЬС-ОПРОС ---
 @bot.callback_query_handler(func=lambda call: call.data == "q_lunch")
 def question_lunch(call):
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("✅ Да, всё вовремя", callback_data="lunch_1"))
-    markup.add(types.InlineKeyboardButton("❌ Нет, не успел / не отпустили", callback_data="lunch_0"))
     bot.edit_message_text(
         "🍽 **Вопрос 1 из 3:**\n\nУспел ли ты сегодня нормально пообедать и отдохнуть?",
         call.message.chat.id,
         call.message.message_id,
-        reply_markup=markup,
+        reply_markup=keyboards.build_lunch_menu(),
         parse_mode="Markdown"
     )
 
@@ -133,14 +93,11 @@ def question_mentor(call):
     val = (call.data == "lunch_1")
     user_sessions.setdefault(call.from_user.id, {})["lunch_ok"] = val
 
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("✅ Да, помог и объяснил", callback_data="mentor_1"))
-    markup.add(types.InlineKeyboardButton("❌ Нет, был занят / остался один", callback_data="mentor_0"))
     bot.edit_message_text(
         "🤝 **Вопрос 2 из 3:**\n\nЕсли возникали затыки в работе, наставник помог тебе?",
         call.message.chat.id,
         call.message.message_id,
-        reply_markup=markup,
+        reply_markup=keyboards.build_mentor_menu(),
         parse_mode="Markdown"
     )
 
@@ -149,78 +106,117 @@ def question_tasks(call):
     val = (call.data == "mentor_1")
     user_sessions.setdefault(call.from_user.id, {})["mentor_helped"] = val
 
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("✅ Да, всё понятно", callback_data="tasks_1"))
-    markup.add(types.InlineKeyboardButton("⚠️ Есть сомнения / не до конца", callback_data="tasks_0"))
     bot.edit_message_text(
         "🎯 **Вопрос 3 из 3:**\n\nПонятно ли, какие задачи стоят перед тобой на завтра?",
         call.message.chat.id,
         call.message.message_id,
-        reply_markup=markup,
+        reply_markup=keyboards.build_tasks_clear_menu(),
         parse_mode="Markdown"
     )
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("tasks_"))
-def finish_pulse(call):
+def ask_comment(call):
     val = (call.data == "tasks_1")
     uid = call.from_user.id
-    session = user_sessions.setdefault(uid, {})
-    session["tasks_clear"] = val
+    user_sessions.setdefault(uid, {})["tasks_clear"] = val
 
-    emp_id = session.get("emp_id", 1)
-    lunch_ok = session.get("lunch_ok", True)
-    mentor_helped = session.get("mentor_helped", True)
-    tasks_clear = val
-
-    if not lunch_ok or not mentor_helped:
-        risk_level = "RED"
-        comment = "Скрытый стресс: пропуск обеда или наставник не помог"
-    elif not tasks_clear:
-        risk_level = "YELLOW"
-        comment = "Непонимание задач на завтра"
-    else:
-        risk_level = "GREEN"
-        comment = "Смена прошла продуктивно"
-
-    save_pulse(emp_id, lunch_ok, mentor_helped, tasks_clear, False, comment, risk_level)
-
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("⬅️ В главное меню", callback_data="menu"))
     bot.edit_message_text(
-        "🙌 **Спасибо за честные ответы!**\n\n"
-        "Они помогают нам вовремя увидеть проблемы и сделать твои смены комфортнее. Хорошего отдыха!",
+        "💬 **Почти готово!**\n\n"
+        "Хочешь добавить что-то от себя своими словами или рассказать о проблеме?",
         call.message.chat.id,
         call.message.message_id,
-        reply_markup=markup,
+        reply_markup=keyboards.build_comment_prompt_menu(),
         parse_mode="Markdown"
     )
 
+@bot.callback_query_handler(func=lambda call: call.data == "comment_prompt")
+def prompt_comment(call):
+    user_sessions.setdefault(call.from_user.id, {})["state"] = "awaiting_comment_text"
+    bot.edit_message_text(
+        "✍️ **Напиши твой комментарий в чат:**\n*(мы сразу передадим его руководителю)*",
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=keyboards.build_back_menu(),
+        parse_mode="Markdown"
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == "finish_no_comment")
+def finish_without_comment(call):
+    save_session_pulse(call.from_user.id, custom_comment=None)
+    bot.edit_message_text(
+        "🙌 **Спасибо за честные ответы!**\n\n"
+        "Они помогают нам делать твои смены комфортнее. Хорошего отдыха!",
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=keyboards.build_back_menu(),
+        parse_mode="Markdown"
+    )
+
+def save_session_pulse(uid, custom_comment=None):
+    session = user_sessions.setdefault(uid, {})
+    emp_id = session.get("emp_id", 1)
+    lunch_ok = session.get("lunch_ok", True)
+    mentor_helped = session.get("mentor_helped", True)
+    tasks_clear = session.get("tasks_clear", True)
+
+    if not lunch_ok or not mentor_helped:
+        risk_level = "RED"
+        default_comment = "Скрытый стресс: пропуск обеда или наставник не помог"
+    elif not tasks_clear:
+        risk_level = "YELLOW"
+        default_comment = "Непонимание задач на завтра"
+    else:
+        risk_level = "GREEN"
+        default_comment = "Смена прошла продуктивно"
+
+    final_comment = custom_comment if custom_comment else default_comment
+    db.save_pulse(emp_id, lunch_ok, mentor_helped, tasks_clear, False, final_comment, risk_level)
+    session["state"] = None
+
+# --- 4. ТЕКСТОВЫЕ КОММЕНТАРИИ ---
+@bot.message_handler(func=lambda message: True)
+def handle_text_messages(message):
+    uid = message.from_user.id
+    session = user_sessions.setdefault(uid, {})
+    state = session.get("state")
+
+    if state == "awaiting_comment_text":
+        comment_text = message.text.strip()
+        save_session_pulse(uid, custom_comment=comment_text)
+        bot.send_message(
+            message.chat.id,
+            "🙌 **Комментарий принят и сохранён в дашборде!**\nСпасибо за обратную связь, хорошего отдыха!",
+            reply_markup=keyboards.build_back_menu(),
+            parse_mode="Markdown"
+        )
+    else:
+        bot.send_message(message.chat.id, "Выбери действие в меню:", reply_markup=keyboards.build_main_menu())
+
+# --- 5. SOS И МЕНЮ ---
 @bot.callback_query_handler(func=lambda call: call.data == "sos")
 def trigger_sos(call):
     uid = call.from_user.id
     emp_id = user_sessions.get(uid, {}).get("emp_id", 1)
+    db.save_pulse(emp_id, False, False, False, True, "Сотрудник запросил помощь через кнопку SOS", "RED")
 
-    save_pulse(emp_id, False, False, False, True, "Сотрудник запросил помощь через SOS", "RED")
-
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("⬅️ В главное меню", callback_data="menu"))
     bot.edit_message_text(
         "🚨 **Сигнал тревоги принят!**\n\n"
         "Мы передали информацию руководителю адаптации. С тобой свяжутся в ближайшее время.",
         call.message.chat.id,
         call.message.message_id,
-        reply_markup=markup,
+        reply_markup=keyboards.build_back_menu(),
         parse_mode="Markdown"
     )
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu")
 def back_menu(call):
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("📋 Памятка на смену", callback_data="memo"))
-    markup.add(types.InlineKeyboardButton("📊 Пройти пульс дня (15 сек)", callback_data="q_lunch"))
-    markup.add(types.InlineKeyboardButton("🆘 Мне нужна помощь (SOS)", callback_data="sos"))
-    bot.edit_message_text("Главное меню напарника:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+    bot.edit_message_text(
+        "Главное меню напарника:",
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=keyboards.build_main_menu()
+    )
 
 if __name__ == "__main__":
-    print("Бот запущен...")
+    print("Бот запущен (модульная архитектура)...")
     bot.infinity_polling()
