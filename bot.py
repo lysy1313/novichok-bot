@@ -196,8 +196,15 @@ def handle_text_messages(message):
 @bot.callback_query_handler(func=lambda call: call.data == "sos")
 def trigger_sos(call):
     uid = call.from_user.id
-    emp_id = user_sessions.get(uid, {}).get("emp_id", 1)
-    db.save_pulse(emp_id, False, False, False, True, "Сотрудник запросил помощь через кнопку SOS", "RED")
+    session = user_sessions.setdefault(uid, {})
+    emp_id = session.get("emp_id", 1)
+
+    # Сохраняем реальные ответы пользователя по обеду/наставнику, если они уже были, не затирая их ложно в красный
+    lunch_ok = session.get("lunch_ok", True)
+    mentor_helped = session.get("mentor_helped", True)
+    tasks_clear = session.get("tasks_clear", True)
+
+    db.save_pulse(emp_id, lunch_ok, mentor_helped, tasks_clear, True, "Сотрудник запросил помощь через кнопку SOS", "RED")
 
     bot.edit_message_text(
         "🚨 **Сигнал тревоги принят!**\n\n"
